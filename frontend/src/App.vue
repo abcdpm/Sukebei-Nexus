@@ -27,25 +27,26 @@
         <span class="animate-pulse text-lg tracking-widest">少女祈祷中...</span>
       </div>
 
-      <div v-else class="columns-1 sm:columns-2 md:columns-3 lg:columns-4 gap-6 space-y-6">
+      <div v-else class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
         
         <div v-for="item in items" :key="item.code" 
-             class="break-inside-avoid bg-bus-card border border-bus-border rounded-lg overflow-hidden hover:border-bus-primary transition-colors relative shadow-sm"
+             class="bg-bus-card border border-bus-border rounded-lg overflow-hidden flex flex-col hover:border-bus-primary transition-colors relative shadow-sm"
              :class="{'opacity-50 grayscale': item.is_downloaded}">
           
-          <div class="absolute top-2 left-2 z-10 bg-black/50 rounded p-1 backdrop-blur-md">
+          <div class="absolute top-2 right-2 z-10 bg-black/50 rounded p-1 backdrop-blur-md">
             <input type="checkbox" v-model="item.selected" @change="updateSelection" class="w-5 h-5 accent-bus-primary cursor-pointer">
           </div>
 
-          <div v-if="item.is_downloaded" class="absolute top-2 right-2 z-10 bg-bus-green-bg text-bus-text-light text-xs px-2 py-1 rounded shadow">
+          <div v-if="item.is_downloaded" class="absolute top-2 left-2 z-10 bg-bus-green-bg text-bus-text-light text-xs px-2 py-1 rounded shadow">
             已推送记录
           </div>
 
-          <div class="relative bg-bus-bg overflow-hidden cursor-pointer group" 
+          <div class="relative w-full aspect-[2/3] bg-[#1a1c1d] overflow-hidden cursor-pointer group flex-shrink-0" 
                @click="openViewer([item.meta?.cover, ...(item.meta?.samples || [])], 0)">
             <img v-if="item.meta?.cover" :src="item.meta.cover" loading="lazy" 
-                 class="w-full h-auto block object-contain group-hover:opacity-90 transition-opacity" />
-            <div v-else class="absolute inset-0 flex items-center justify-center text-bus-text-muted text-sm min-h-[300px]">
+                 class="w-full h-full object-cover group-hover:opacity-90 transition-opacity" />
+            
+            <div v-else class="absolute inset-0 flex items-center justify-center text-bus-text-muted text-sm">
               {{ item.meta === null ? '正在连接深海...' : '暂无封面' }}
             </div>
             
@@ -54,16 +55,16 @@
             </div>
           </div>
 
-          <div class="p-4">
+          <div class="p-4 flex-grow flex flex-col">
             <div class="flex justify-between items-center text-sm mb-2 border-b border-bus-border pb-2">
               <span class="text-bus-primary font-bold text-lg" :class="{'text-purple-400': item.code.includes('FC2')}">{{ item.code }}</span>
             </div>
             
-            <h3 class="text-sm text-bus-text-light line-clamp-3 mb-3" :title="item.title">
+            <h3 class="text-sm text-bus-text-light line-clamp-3 mb-3 flex-grow" :title="item.title">
               {{ item.title }}
             </h3>
 
-            <div class="relative group/thumbs mt-2" v-if="item.meta?.samples?.length > 0">
+            <div class="relative group/thumbs mt-auto" v-if="item.meta?.samples?.length > 0">
               <div class="absolute left-0 top-0 bottom-0 w-8 bg-gradient-to-r from-bus-card to-transparent z-10 opacity-0 group-hover/thumbs:opacity-100 flex items-center justify-start pl-1 cursor-pointer transition-opacity"
                    @mouseenter="startScroll($event, -1)" @mouseleave="stopScroll">
                  <span class="text-white drop-shadow-md text-xl">&lt;</span>
@@ -82,12 +83,14 @@
             </div>
 
             <div class="flex justify-between items-center mt-4 pt-3 border-t border-bus-border">
-              <div class="flex gap-1">
-                <span class="bg-bus-blue-bg text-bus-text-light text-[11px] px-2 py-0.5 rounded shadow">HD</span>
-              </div>
-              <div class="flex gap-3 text-bus-text-muted text-xs">
-                <a :href="item.code.includes('FC2') ? `https://adult.contents.fc2.com/article/${item.code.split('-')[2]}/` : `https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary">官网</a>
-                <a :href="`https://sukebei.nyaa.si/?f=0&c=0_0&q=${item.code}`" target="_blank" class="hover:text-bus-primary">Nyaa</a>
+              <div class="flex gap-2 text-bus-text-muted text-xs flex-wrap">
+                <a :href="item.code.includes('FC2') ? `https://adult.contents.fc2.com/article/${item.code.split('-')[2]}/` : `https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">官网</a>
+                
+                <a :href="`https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">JavBus</a>
+                
+                <a :href="`https://www.avbase.net/works?q=${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">Avbase</a>
+                
+                <a :href="`https://sukebei.nyaa.si/?f=0&c=0_0&q=${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">Nyaa</a>
               </div>
             </div>
           </div>
@@ -95,14 +98,24 @@
 
       </div>
 
-      <div v-if="!loading && items.length > 0" class="flex justify-center items-center gap-6 mt-12 mb-8">
-         <button @click="fetchRss(currentPage - 1)" :disabled="currentPage <= 1" class="px-6 py-2 bg-bus-card border border-bus-border rounded hover:bg-bus-primary hover:text-white transition-colors disabled:opacity-50 shadow">
-           上一页
-         </button>
-         <span class="text-bus-text-light font-medium tracking-widest">第 {{ currentPage }} 页</span>
-         <button @click="fetchRss(currentPage + 1)" class="px-6 py-2 bg-bus-card border border-bus-border rounded hover:bg-bus-primary hover:text-white transition-colors shadow">
-           下一页
-         </button>
+      <div v-if="!loading && items.length > 0 && totalPages > 1" class="flex justify-center items-center mt-12 mb-8">
+        
+        <button @click="fetchRss(currentPage - 1)" :disabled="currentPage <= 1" class="px-3 py-1.5 bg-bus-card border border-bus-border rounded disabled:opacity-50 hover:bg-bus-card-hover mx-1">
+          &lt;
+        </button>
+        
+        <div class="flex gap-1 mx-2">
+          <button v-for="p in visiblePages" :key="p" @click="fetchRss(p)" 
+                  class="w-8 h-8 rounded border border-bus-border flex items-center justify-center transition-colors text-sm"
+                  :class="currentPage === p ? 'bg-bus-primary text-white border-bus-primary' : 'bg-bus-card hover:bg-bus-card-hover'">
+            {{ p }}
+          </button>
+        </div>
+
+        <button @click="fetchRss(currentPage + 1)" :disabled="currentPage >= totalPages" class="px-3 py-1.5 bg-bus-card border border-bus-border rounded disabled:opacity-50 hover:bg-bus-card-hover mx-1">
+          &gt;
+        </button>
+
       </div>
     </main>
 
@@ -156,7 +169,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 
 const API_BASE = import.meta.env.DEV ? 'http://localhost:8000' : ''
 
@@ -170,16 +183,27 @@ const testing = ref(false)
 const testMsg = ref('')
 const testSuccess = ref(false)
 const currentPage = ref(1)
+const totalPages = ref(1)
 
 const settings = ref({ qb_host: '', qb_user: '', qb_pass: '', rss_url: '' })
 
-// 网页标题重命名
+// 生成当前可视的页码列表 (例如展示当前页及前后2页)
+const visiblePages = computed(() => {
+  const pages = []
+  const start = Math.max(1, currentPage.value - 2)
+  const end = Math.min(totalPages.value, currentPage.value + 2)
+  for (let i = start; i <= end; i++) {
+    pages.push(i)
+  }
+  return pages
+})
+
 onMounted(() => {
   document.title = 'SukebeiNexus'
   fetchRss(1)
 })
 
-// 核心：请求并异步刮削，增加分页支持
+// 核心：请求并异步刮削
 const fetchRss = async (page) => {
   if (page < 1) return
   loading.value = true
@@ -189,6 +213,7 @@ const fetchRss = async (page) => {
   try {
     const res = await fetch(`${API_BASE}/api/rss?page=${page}`)
     const json = await res.json()
+    totalPages.value = json.total_pages || 1
     items.value = json.data.map(item => ({ ...item, selected: false, meta: null }))
     // 并发触发图片刮削
     items.value.forEach(fetchMetadata)

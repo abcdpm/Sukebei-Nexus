@@ -14,6 +14,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from qbittorrentapi import Client
 
+# --- 数据库配置 ---
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{DATA_DIR}/nexus.db"
@@ -47,10 +48,12 @@ def get_db():
 app = FastAPI(title="Sukebei-Nexus API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# --- 请求伪装 Headers，防止被目标网站拦截 ---
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+# --- 1. 设置 API ---
 class SettingsDTO(BaseModel):
     qb_host: str
     qb_user: str
@@ -89,21 +92,24 @@ def test_qb_connection(config: SettingsDTO):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"连接失败: {str(e)}")
 
+# --- 2. RSS 解析与正则修复 ---
 @app.get("/api/rss")
 def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
     setting = db.query(AppSettings).first()
-    # 根据页码动态修改 RSS 请求链接 (针对 Nyaa)
     base_url = setting.rss_url if setting and setting.rss_url else "https://sukebei.nyaa.si/?page=rss&u=offkab"
-    if page > 1:
-        # Nyaa 的分页参数是 p=2
-        base_url += f"&p={page}"
         
     feed = feedparser.parse(base_url)
     results = []
-    
     downloaded_codes = [h.code for h in db.query(DownloadHistory).all()]
     
-    entries = feed.entries[:limit]
+    # 【修复分页逻辑】RSS 默认给 100 条，我们要根据当前页码在后端进行切片
+    total_items = len(feed.entries)
+    total_pages = (total_items + limit - 1) // limit if total_items > 0 else 1
+    
+    start = (page - 1) * limit
+    end = start + limit
+    entries = feed.entries[start:end]
+    
     for entry in entries:
         title = entry.title
         
@@ -126,8 +132,10 @@ def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
             "title": title, "link": entry.link, "code": code,
             "is_downloaded": code in downloaded_codes
         })
-    return {"total": 1000, "page": page, "data": results} # 伪造 total 允许无限翻页
+    # 返回总页数给前端生成 1 2 3 4 按钮
+    return {"total_pages": total_pages, "page": page, "data": results}
 
+# --- 3. 封面刮削 (分流处理) ---
 @app.get("/api/metadata/{code}")
 async def get_metadata(code: str):
     if code == "UNKNOWN":
@@ -148,27 +156,43 @@ async def get_metadata(code: str):
             except Exception as e:
                 return {"cover": "", "samples": [], "error": str(e)}
                 
-        # B. 普通番号 JavBus 刮削 (加入 404 降级至无码区重试机制)
+        # B. 普通番号 JavBus 刮削 (加入 404 降级至无码区重试机制，以及 Search 页面回落)
         else:
             bus_url = f"https://www.javbus.com/{code}"
             try:
                 resp = await client.get(bus_url, follow_redirects=True)
-                # 如果有码区找不到 (比如 HEYZO, 加勒比)，尝试无码区路径
+                
+                # 如果有码区找不到，尝试无码区路径
                 if resp.status_code == 404:
                     bus_url = f"https://www.javbus.com/uncensored/{code}"
                     resp = await client.get(bus_url, follow_redirects=True)
                     
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 cover_tag = soup.select_one('.bigImage img')
-                cover_img = cover_tag['src'] if cover_tag else ""
+                cover_img = ""
+                
+                # 如果详情页依然拿不到，直接请求 Search 页面刮削第一张瀑布流图片
+                if cover_tag:
+                    cover_img = cover_tag['src']
+                else:
+                    search_url = f"https://www.javbus.com/search/{code}"
+                    resp_search = await client.get(search_url, follow_redirects=True)
+                    soup_search = BeautifulSoup(resp_search.text, 'html.parser')
+                    search_img = soup_search.select_one('#waterfall .movie-box img')
+                    if search_img:
+                        cover_img = search_img.get('src', '')
+
+                # 补全绝对路径
                 if cover_img and not cover_img.startswith('http'):
                     cover_img = "https://www.javbus.com" + cover_img
                     
-                samples = [img['src'] for img in soup.select('.sample-box img')]
+                # 提取详情页预览图
+                samples = [img['src'] for img in soup.select('.sample-box img') if img.get('src')]
                 return {"cover": cover_img, "samples": samples}
             except Exception as e:
                 return {"cover": "", "samples": [], "error": str(e)}
 
+# --- 4. qB 推送 ---
 class DownloadRequest(BaseModel):
     items: list[dict]
 
