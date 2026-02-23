@@ -52,7 +52,6 @@ Base.metadata.create_all(bind=engine)
 # 自动数据库升级与自愈修复
 try:
     with engine.connect() as conn:
-        # 尝试添加新字段，如果已存在则忽略
         conn.execute(text("ALTER TABLE app_settings ADD COLUMN block_prefixes VARCHAR DEFAULT 'XB-,MD-,JV-'"))
         conn.commit()
 except Exception:
@@ -60,7 +59,7 @@ except Exception:
 
 try:
     with engine.connect() as conn:
-        # 核心修复：清理掉之前因为网络超时导致只抓到了封面，但没有抓到详细图的坏缓存，让它们重新刮削！
+        # 核心修复：清理掉之前因为网络超时导致没有抓到详细图的坏缓存，让它们重新满血复活！
         conn.execute(text("DELETE FROM metadata_cache WHERE samples_json = '[]' OR samples_json IS NULL"))
         conn.commit()
 except Exception:
@@ -159,7 +158,7 @@ def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
         elif match_normal:
             code = match_normal.group(1).upper()
             
-        # 【新增逻辑】：如果番号匹配屏蔽前缀，直接丢弃，不加入返回列表
+        # 如果番号匹配屏蔽前缀，直接丢弃
         if any(code.startswith(bp) for bp in block_prefixes):
             continue
             
@@ -168,7 +167,6 @@ def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
             "is_downloaded": code in downloaded_codes
         })
 
-    # 【修复分页逻辑】在过滤后干净的列表上进行切片，保证每页数量对齐
     total_items = len(filtered_entries)
     total_pages = (total_items + limit - 1) // limit if total_items > 0 else 1
     
@@ -177,21 +175,25 @@ def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
     
     return {"total_pages": total_pages, "page": page, "data": filtered_entries[start:end]}
 
-# 工具函数：异步下载图片并返回是否成功
+# 工具函数：并发安全的极速图片下载
 async def download_image(client, url, filepath):
     if not url: return False
-    if os.path.exists(filepath): return True # 优先读取本地
+    if url.startswith('//'): url = 'https:' + url # 修复 FC2 相对路径
+    if os.path.exists(filepath): return True # 本地秒开
     try:
-        resp = await client.get(url, cookies={'age_check_done': '1'}, follow_redirects=True)
+        resp = await client.get(url, cookies={'age_check_done': '1'}, follow_redirects=True, timeout=10.0)
         if resp.status_code == 200:
-            with open(filepath, 'wb') as f:
-                f.write(resp.content)
+            # 放入后台线程写入，绝对不阻塞异步循环
+            def write_file():
+                with open(filepath, 'wb') as f:
+                    f.write(resp.content)
+            await asyncio.to_thread(write_file)
             return True
     except Exception:
         pass
     return False
 
-# 工具函数：生成 DMM 标准 ID (例如 SCPX-547 -> scpx00547)
+# 工具函数：生成 DMM 标准 ID
 def get_dmm_id(code: str) -> str:
     match = re.match(r'([a-zA-Z]+)[-_]?(\d+)', code)
     if match:
@@ -200,24 +202,15 @@ def get_dmm_id(code: str) -> str:
         return f"{prefix}{num}"
     return code.lower().replace('-', '')
 
-# --- 3. 封面刮削 (分流处理与本地缓存) ---
+# --- 3. 封面刮削 (极速并发版) ---
 @app.get("/api/metadata/{code}")
 async def get_metadata(code: str, db: Session = Depends(get_db)):
     if code == "UNKNOWN":
         return {"cover": "", "samples": []}
         
-    # 需求3: 检查屏蔽前缀 (双重保险)
-    setting = db.query(AppSettings).first()
-    if setting and setting.block_prefixes:
-        blocks = [p.strip().upper() for p in setting.block_prefixes.split(',') if p.strip()]
-        for bp in blocks:
-            if code.upper().startswith(bp):
-                return {"cover": "", "samples": [], "error": "Blocked by prefix"}
-
     # 需求1: 优先从本地 SQLite 缓存读取
     cached = db.query(MetadataCache).filter(MetadataCache.code == code).first()
     if cached and cached.samples_json:
-        # 如果缓存里确实存了东西，直接返回秒开
         samples_list = json.loads(cached.samples_json)
         if len(samples_list) > 0 or code.startswith("FC2"):
             return {"cover": cached.cover_path, "samples": samples_list}
@@ -227,7 +220,10 @@ async def get_metadata(code: str, db: Session = Depends(get_db)):
     is_dmm = False
     dmm_base_url = ""
 
-    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+    # 使用较大的连接池
+    limits = httpx.Limits(max_connections=50, max_keepalive_connections=10)
+    async with httpx.AsyncClient(timeout=15.0, headers=HEADERS, limits=limits) as client:
+        
         # A. FC2 资源官网刮削
         if code.startswith("FC2-PPV-"):
             fc2_id = code.split('-')[-1]
@@ -236,17 +232,25 @@ async def get_metadata(code: str, db: Session = Depends(get_db)):
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 og_img = soup.find('meta', property='og:image')
                 cover_img = og_img['content'] if og_img else ""
-                samples = [img.get('src') for img in soup.select('.items_article_SampleImages img') if img.get('src')]
+                
+                # 双重保险：优先通过 CSS 抓取，抓不到就用正则强行在源码里找
+                for img in soup.select('.items_article_SampleImages img, .sample-image-wrap img'):
+                    src = img.get('src') or img.get('data-src') or img.get('href')
+                    if src: samples.append(src)
+                    
+                if not samples:
+                    found = re.findall(r'https?://[^\s"\'<>]+/sample/[^\s"\'<>]+\.(?:jpg|png|jpeg)', resp.text)
+                    samples = list(dict.fromkeys(found)) # 去重
             except Exception:
                 pass
                 
-        # B. 普通番号刮削 (DMM优先 -> JavBus有码/无码 -> Search搜索)
+        # B. 普通番号刮削
         else:
-            # 需求4: 优先尝试 DMM 官网强行组合提取
             dmm_id = get_dmm_id(code)
             dmm_base_url = f"https://pics.dmm.co.jp/digital/video/{dmm_id}/{dmm_id}"
             
             try:
+                # 探测 DMM
                 resp_dmm = await client.head(f"{dmm_base_url}pl.jpg", cookies={'age_check_done': '1'}, follow_redirects=True)
                 if resp_dmm.status_code == 200:
                     cover_img = f"{dmm_base_url}pl.jpg"
@@ -256,10 +260,8 @@ async def get_metadata(code: str, db: Session = Depends(get_db)):
                 
             # 若 DMM 失败，回落使用 JavBus
             if not cover_img:
-                # 需求2: 数字开头的直接优先从 /uncensored/ 刮削
                 first_url = f"https://www.javbus.com/uncensored/{code}" if code[0].isdigit() else f"https://www.javbus.com/{code}"
                 second_url = f"https://www.javbus.com/{code}" if code[0].isdigit() else f"https://www.javbus.com/uncensored/{code}"
-                
                 try:
                     resp = await client.get(first_url, follow_redirects=True)
                     if resp.status_code == 404:
@@ -284,35 +286,49 @@ async def get_metadata(code: str, db: Session = Depends(get_db)):
                 except Exception:
                     pass
 
-        # 下载图片到本地逻辑
+        # === 核心优化：并发下载图片，不再傻等 ===
+        tasks = []
+        c_path = ""
         local_cover = ""
-        local_samples = []
         
+        # 准备封面下载任务
         if cover_img:
+            if cover_img.startswith('//'): cover_img = 'https:' + cover_img
             ext = cover_img.split('.')[-1][:4]
             ext = re.sub(r'[^a-zA-Z0-9]', '', ext) or 'jpg'
             c_path = f"{IMG_DIR}/{code}_cover.{ext}"
-            if await download_image(client, cover_img, c_path):
-                local_cover = f"/img/{code}_cover.{ext}"
-                
-        # 详细图分流下载
+            tasks.append(download_image(client, cover_img, c_path))
+        else:
+            tasks.append(asyncio.sleep(0)) # 占位
+            
+        # 准备详细图下载任务 (限制最多前10张，提升极速加载体验)
+        s_paths = []
         if is_dmm:
-            # DMM: 顺序探测下载，一旦遇到 404 马上停止，绝不浪费网络请求
-            for i in range(1, 21):
+            for i in range(1, 11):
                 s_url = f"{dmm_base_url}jp-{i}.jpg"
                 s_path = f"{IMG_DIR}/{code}_sample_{i}.jpg"
-                if await download_image(client, s_url, s_path):
-                    local_samples.append(f"/img/{code}_sample_{i}.jpg")
-                else:
-                    break
+                s_paths.append((s_path, f"/img/{code}_sample_{i}.jpg"))
+                tasks.append(download_image(client, s_url, s_path))
         else:
-            # JavBus / FC2: 直接下载拿到的数组
-            for idx, s_url in enumerate(samples):
+            for idx, s_url in enumerate(samples[:10]):
+                if s_url.startswith('//'): s_url = 'https:' + s_url
                 ext = s_url.split('.')[-1][:4]
                 ext = re.sub(r'[^a-zA-Z0-9]', '', ext) or 'jpg'
                 s_path = f"{IMG_DIR}/{code}_sample_{idx+1}.{ext}"
-                if await download_image(client, s_url, s_path):
-                    local_samples.append(f"/img/{code}_sample_{idx+1}.{ext}")
+                s_paths.append((s_path, f"/img/{code}_sample_{idx+1}.{ext}"))
+                tasks.append(download_image(client, s_url, s_path))
+
+        # 【并发执行】瞬间完成所有下载！
+        results = await asyncio.gather(*tasks)
+        
+        # 整理结果
+        if results[0] and c_path:
+            local_cover = f"/img/{os.path.basename(c_path)}"
+            
+        local_samples = []
+        for idx, success in enumerate(results[1:]):
+            if success:
+                local_samples.append(s_paths[idx][1])
 
         # 写入缓存
         if local_cover or local_samples:
