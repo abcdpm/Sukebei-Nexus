@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bus-bg: #222527;
+  --color-bus-card: #2b2f31;
+  --color-bus-card-hover: #363a3c;
+  --color-bus-border: #3a3e41;
+  --color-bus-text-main: #c8c3bc;
+  --color-bus-text-muted: #988f81;
+  --color-bus-text-light: #e8e6e3;
+  --color-bus-primary: #3391ff;
+  --color-bus-blue-bg: #204d73;
+  --color-bus-green: #69be69;
+  --color-bus-green-bg: #367e36;
+}
+
+body {
+  background-color: var(--color-bus-bg);
+  color: var(--color-bus-text-main);
+  font-family: "Helvetica Neue", Helvetica, Arial, "Microsoft YaHei", sans-serif;
+}
+
+/* 隐藏滚动条但保留滚动功能，使底部小图更加优美 */
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

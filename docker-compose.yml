@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  sukebei-nexus:
+    build: .
+    container_name: sukebei-nexus
+    restart: unless-stopped
+    ports:
+      - "8089:8000" # 左侧 8089 是您访问 Unraid 的端口，可随意修改
+    volumes:
+      - ./data:/app/data # 持久化 SQLite 数据库
+    # environment:
+      # 如果您的网络环境拉取 Javbus 慢或被墙，取消注释并修改下方代理，指向您局域网的代理软件
+      # - HTTP_PROXY=http://192.168.0.x:10808
+      # - HTTPS_PROXY=http://192.168.0.x:10808

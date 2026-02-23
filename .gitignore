@@ -1,3 +1,83 @@
+# 忽略挂载的 SQLite 数据库目录，防止泄露个人 qB 配置和下载历史
+data/
+*.db
+*.sqlite3
+
+# 忽略环境变量文件
+.env
+.env.*
+!.env.example
+
+# =========================
+# 🎨 前端构建与依赖 (Node.js / Vue / Vite)
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+frontend/.eslintcache
+
+# npm/yarn/pnpm 的错误日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# ⚙️ 后端运行环境 (Python / FastAPI)
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境 (如果您在本地开发时创建了)
+venv/
+env/
+.venv/
+backend/venv/
+backend/env/
+
+# 测试与打包缓存
+.pytest_cache/
+.coverage
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# =========================
+# 💻 操作系统与编辑器生成文件
+# =========================
+# Windows (防毒软件或资源管理器生成的缓存)
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE 配置文件 (VS Code / WebStorm / PyCharm 等)
+.idea/
+.vscode/
+*.swp
+*.swo
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -1,0 +1,197 @@
+import os
+import re
+import feedparser
+import httpx
+import asyncio
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, String, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from qbittorrentapi import Client
+
+DATA_DIR = "./data"
+os.makedirs(DATA_DIR, exist_ok=True)
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DATA_DIR}/nexus.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class DownloadHistory(Base):
+    __tablename__ = "download_history"
+    code = Column(String, primary_key=True, index=True)
+    title = Column(String)
+    torrent_url = Column(String)
+
+class AppSettings(Base):
+    __tablename__ = "app_settings"
+    id = Column(Integer, primary_key=True, index=True)
+    qb_host = Column(String, default="http://192.168.0.x:8080")
+    qb_user = Column(String, default="admin")
+    qb_pass = Column(String, default="adminadmin")
+    rss_url = Column(String, default="https://sukebei.nyaa.si/?page=rss&u=offkab")
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+app = FastAPI(title="Sukebei-Nexus API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+class SettingsDTO(BaseModel):
+    qb_host: str
+    qb_user: str
+    qb_pass: str
+    rss_url: str
+
+@app.get("/api/settings")
+def get_settings(db: Session = Depends(get_db)):
+    setting = db.query(AppSettings).first()
+    if not setting:
+        setting = AppSettings()
+        db.add(setting)
+        db.commit()
+    return setting
+
+@app.post("/api/settings")
+def save_settings(config: SettingsDTO, db: Session = Depends(get_db)):
+    setting = db.query(AppSettings).first()
+    if not setting:
+        setting = AppSettings(**config.dict())
+        db.add(setting)
+    else:
+        setting.qb_host = config.qb_host
+        setting.qb_user = config.qb_user
+        setting.qb_pass = config.qb_pass
+        setting.rss_url = config.rss_url
+    db.commit()
+    return {"status": "success"}
+
+@app.post("/api/qb/test")
+def test_qb_connection(config: SettingsDTO):
+    try:
+        qbt_client = Client(host=config.qb_host, username=config.qb_user, password=config.qb_pass)
+        qbt_client.auth_log_in()
+        return {"status": "success", "message": f"连接成功！qB版本: {qbt_client.app.version}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"连接失败: {str(e)}")
+
+@app.get("/api/rss")
+def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
+    setting = db.query(AppSettings).first()
+    # 根据页码动态修改 RSS 请求链接 (针对 Nyaa)
+    base_url = setting.rss_url if setting and setting.rss_url else "https://sukebei.nyaa.si/?page=rss&u=offkab"
+    if page > 1:
+        # Nyaa 的分页参数是 p=2
+        base_url += f"&p={page}"
+        
+    feed = feedparser.parse(base_url)
+    results = []
+    
+    downloaded_codes = [h.code for h in db.query(DownloadHistory).all()]
+    
+    entries = feed.entries[:limit]
+    for entry in entries:
+        title = entry.title
+        
+        # 1. 优先匹配 FC2 (绕过混淆字符，只取后面 5-8 位数字)
+        match_fc2 = re.search(r'FC2[^\d]*(\d{5,8})', title, re.IGNORECASE)
+        # 2. 匹配加长版日期番号 (如 022326-001, 022326-001-CARIB)
+        match_date = re.search(r'(\d{6}[-_]\d{3}(?:[-_][A-Za-z]+)?)', title, re.IGNORECASE)
+        # 3. 匹配常规番号 (如 HEYZO-3789, IPX-123)，排除掉 FC2
+        match_normal = re.search(r'\b(?!(?:PPV|FC2)\-)([A-Za-z]{2,8}[-_]\d{2,5})\b', title, re.IGNORECASE)
+        
+        code = "UNKNOWN"
+        if match_fc2:
+            code = f"FC2-PPV-{match_fc2.group(1)}"
+        elif match_date:
+            code = match_date.group(1).upper()
+        elif match_normal:
+            code = match_normal.group(1).upper()
+            
+        results.append({
+            "title": title, "link": entry.link, "code": code,
+            "is_downloaded": code in downloaded_codes
+        })
+    return {"total": 1000, "page": page, "data": results} # 伪造 total 允许无限翻页
+
+@app.get("/api/metadata/{code}")
+async def get_metadata(code: str):
+    if code == "UNKNOWN":
+        return {"cover": "", "samples": []}
+    
+    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+        # A. FC2 资源官网刮削
+        if code.startswith("FC2-PPV-"):
+            fc2_id = code.split('-')[-1]
+            cookies = {'age_check_done': '1'}
+            try:
+                resp = await client.get(f"https://adult.contents.fc2.com/article/{fc2_id}/", cookies=cookies, follow_redirects=True)
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                og_img = soup.find('meta', property='og:image')
+                cover_img = og_img['content'] if og_img else ""
+                samples = [img.get('src') for img in soup.select('.items_article_SampleImages img') if img.get('src')]
+                return {"cover": cover_img, "samples": samples}
+            except Exception as e:
+                return {"cover": "", "samples": [], "error": str(e)}
+                
+        # B. 普通番号 JavBus 刮削 (加入 404 降级至无码区重试机制)
+        else:
+            bus_url = f"https://www.javbus.com/{code}"
+            try:
+                resp = await client.get(bus_url, follow_redirects=True)
+                # 如果有码区找不到 (比如 HEYZO, 加勒比)，尝试无码区路径
+                if resp.status_code == 404:
+                    bus_url = f"https://www.javbus.com/uncensored/{code}"
+                    resp = await client.get(bus_url, follow_redirects=True)
+                    
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                cover_tag = soup.select_one('.bigImage img')
+                cover_img = cover_tag['src'] if cover_tag else ""
+                if cover_img and not cover_img.startswith('http'):
+                    cover_img = "https://www.javbus.com" + cover_img
+                    
+                samples = [img['src'] for img in soup.select('.sample-box img')]
+                return {"cover": cover_img, "samples": samples}
+            except Exception as e:
+                return {"cover": "", "samples": [], "error": str(e)}
+
+class DownloadRequest(BaseModel):
+    items: list[dict]
+
+@app.post("/api/qb/download")
+def push_to_qb(req: DownloadRequest, db: Session = Depends(get_db)):
+    setting = db.query(AppSettings).first()
+    try:
+        qbt_client = Client(host=setting.qb_host, username=setting.qb_user, password=setting.qb_pass)
+        qbt_client.auth_log_in()
+        urls = [item['link'] for item in req.items]
+        qbt_client.torrents_add(urls=urls)
+        
+        for item in req.items:
+            if not db.query(DownloadHistory).filter(DownloadHistory.code == item['code']).first():
+                history = DownloadHistory(code=item['code'], title=item['title'], torrent_url=item['link'])
+                db.add(history)
+        db.commit()
+        return {"status": "success", "message": f"成功推送 {len(urls)} 个任务"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"推送失败: {str(e)}")
+
+if os.path.exists("static"):
+    app.mount("/assets", StaticFiles(directory="static/assets"), name="assets")
+    @app.get("/{catchall:path}")
+    def serve_vue_app(catchall: str):
+        return FileResponse("static/index.html")
