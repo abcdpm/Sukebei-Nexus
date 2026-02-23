@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import feedparser
 import httpx
 import asyncio
@@ -9,14 +10,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Integer
+from sqlalchemy import create_engine, Column, String, Integer, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from qbittorrentapi import Client
 
 # --- 数据库配置 ---
 DATA_DIR = "./data"
+IMG_DIR = "./data/img" # 需求1: 图片缓存目录
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(IMG_DIR, exist_ok=True)
+
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{DATA_DIR}/nexus.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -35,8 +39,32 @@ class AppSettings(Base):
     qb_user = Column(String, default="admin")
     qb_pass = Column(String, default="adminadmin")
     rss_url = Column(String, default="https://sukebei.nyaa.si/?page=rss&u=offkab")
+    block_prefixes = Column(String, default="XB-,MD-,JV-") # 需求3: 屏蔽前缀
+
+class MetadataCache(Base):
+    __tablename__ = "metadata_cache"
+    code = Column(String, primary_key=True, index=True)
+    cover_path = Column(String)
+    samples_json = Column(String)
 
 Base.metadata.create_all(bind=engine)
+
+# 自动数据库升级与自愈修复
+try:
+    with engine.connect() as conn:
+        # 尝试添加新字段，如果已存在则忽略
+        conn.execute(text("ALTER TABLE app_settings ADD COLUMN block_prefixes VARCHAR DEFAULT 'XB-,MD-,JV-'"))
+        conn.commit()
+except Exception:
+    pass
+
+try:
+    with engine.connect() as conn:
+        # 核心修复：清理掉之前因为网络超时导致只抓到了封面，但没有抓到详细图的坏缓存，让它们重新刮削！
+        conn.execute(text("DELETE FROM metadata_cache WHERE samples_json = '[]' OR samples_json IS NULL"))
+        conn.commit()
+except Exception:
+    pass
 
 def get_db():
     db = SessionLocal()
@@ -48,9 +76,14 @@ def get_db():
 app = FastAPI(title="Sukebei-Nexus API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# 挂载本地图片目录
+app.mount("/img", StaticFiles(directory=IMG_DIR), name="img")
+
 # --- 请求伪装 Headers，防止被目标网站拦截 ---
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
 # --- 1. 设置 API ---
@@ -59,6 +92,7 @@ class SettingsDTO(BaseModel):
     qb_user: str
     qb_pass: str
     rss_url: str
+    block_prefixes: str
 
 @app.get("/api/settings")
 def get_settings(db: Session = Depends(get_db)):
@@ -80,6 +114,7 @@ def save_settings(config: SettingsDTO, db: Session = Depends(get_db)):
         setting.qb_user = config.qb_user
         setting.qb_pass = config.qb_pass
         setting.rss_url = config.rss_url
+        setting.block_prefixes = config.block_prefixes
     db.commit()
     return {"status": "success"}
 
@@ -101,25 +136,19 @@ def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
         base_url += f"&p={page}"
         
     feed = feedparser.parse(base_url)
-    results = []
     downloaded_codes = [h.code for h in db.query(DownloadHistory).all()]
     
-    # 【修复分页逻辑】RSS 默认给 100 条，我们要根据当前页码在后端进行切片
-    total_items = len(feed.entries)
-    total_pages = (total_items + limit - 1) // limit if total_items > 0 else 1
-    
-    start = (page - 1) * limit
-    end = start + limit
-    entries = feed.entries[start:end]
-    
-    for entry in entries:
+    # 提取屏蔽前缀列表
+    block_prefixes = []
+    if setting and setting.block_prefixes:
+        block_prefixes = [p.strip().upper() for p in setting.block_prefixes.split(',') if p.strip()]
+
+    # 先过滤出有效的条目，彻底踢出被屏蔽的番号
+    filtered_entries = []
+    for entry in feed.entries:
         title = entry.title
-        
-        # 1. 优先匹配 FC2 (绕过混淆字符，只取后面 5-8 位数字)
         match_fc2 = re.search(r'FC2[^\d]*(\d{5,8})', title, re.IGNORECASE)
-        # 2. 匹配加长版日期番号 (如 022326-001, 022326-001-CARIB)
         match_date = re.search(r'(\d{6}[-_]\d{3}(?:[-_][A-Za-z]+)?)', title, re.IGNORECASE)
-        # 3. 匹配常规番号 (如 HEYZO-3789, IPX-123)，排除掉 FC2
         match_normal = re.search(r'\b(?!(?:PPV|FC2)\-)([A-Za-z]{2,8}[-_]\d{2,5})\b', title, re.IGNORECASE)
         
         code = "UNKNOWN"
@@ -130,107 +159,173 @@ def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
         elif match_normal:
             code = match_normal.group(1).upper()
             
-        # 【需求3】清理标题：剥离 ++ 、括号内容以及番号本身
-        clean_title = re.sub(r'^[+\s]+', '', title)  # 去掉开头的 ++
-        clean_title = re.sub(r'^\[.*?\]\s*', '', clean_title)  # 去掉开头的 [FHD] 等
-        if code != "UNKNOWN":
-            # 忽略大小写，将匹配到的番号从标题中剥离
-            clean_title = re.sub(rf'{code}\s*', '', clean_title, flags=re.IGNORECASE).strip()
+        # 【新增逻辑】：如果番号匹配屏蔽前缀，直接丢弃，不加入返回列表
+        if any(code.startswith(bp) for bp in block_prefixes):
+            continue
             
-        results.append({
-            "title": clean_title, "link": entry.link, "code": code,
+        filtered_entries.append({
+            "title": title, "link": entry.link, "code": code,
             "is_downloaded": code in downloaded_codes
         })
-    # 返回总页数给前端生成 1 2 3 4 按钮
-    return {"total_pages": total_pages, "page": page, "data": results}
 
-# --- 3. 封面刮削 (分流处理) ---
+    # 【修复分页逻辑】在过滤后干净的列表上进行切片，保证每页数量对齐
+    total_items = len(filtered_entries)
+    total_pages = (total_items + limit - 1) // limit if total_items > 0 else 1
+    
+    start = (page - 1) * limit
+    end = start + limit
+    
+    return {"total_pages": total_pages, "page": page, "data": filtered_entries[start:end]}
+
+# 工具函数：异步下载图片并返回是否成功
+async def download_image(client, url, filepath):
+    if not url: return False
+    if os.path.exists(filepath): return True # 优先读取本地
+    try:
+        resp = await client.get(url, cookies={'age_check_done': '1'}, follow_redirects=True)
+        if resp.status_code == 200:
+            with open(filepath, 'wb') as f:
+                f.write(resp.content)
+            return True
+    except Exception:
+        pass
+    return False
+
+# 工具函数：生成 DMM 标准 ID (例如 SCPX-547 -> scpx00547)
+def get_dmm_id(code: str) -> str:
+    match = re.match(r'([a-zA-Z]+)[-_]?(\d+)', code)
+    if match:
+        prefix = match.group(1).lower()
+        num = match.group(2).zfill(5)
+        return f"{prefix}{num}"
+    return code.lower().replace('-', '')
+
+# --- 3. 封面刮削 (分流处理与本地缓存) ---
 @app.get("/api/metadata/{code}")
-async def get_metadata(code: str):
+async def get_metadata(code: str, db: Session = Depends(get_db)):
     if code == "UNKNOWN":
         return {"cover": "", "samples": []}
+        
+    # 需求3: 检查屏蔽前缀 (双重保险)
+    setting = db.query(AppSettings).first()
+    if setting and setting.block_prefixes:
+        blocks = [p.strip().upper() for p in setting.block_prefixes.split(',') if p.strip()]
+        for bp in blocks:
+            if code.upper().startswith(bp):
+                return {"cover": "", "samples": [], "error": "Blocked by prefix"}
+
+    # 需求1: 优先从本地 SQLite 缓存读取
+    cached = db.query(MetadataCache).filter(MetadataCache.code == code).first()
+    if cached and cached.samples_json:
+        # 如果缓存里确实存了东西，直接返回秒开
+        samples_list = json.loads(cached.samples_json)
+        if len(samples_list) > 0 or code.startswith("FC2"):
+            return {"cover": cached.cover_path, "samples": samples_list}
     
+    cover_img = ""
+    samples = []
+    is_dmm = False
+    dmm_base_url = ""
+
     async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
         # A. FC2 资源官网刮削
         if code.startswith("FC2-PPV-"):
             fc2_id = code.split('-')[-1]
-            cookies = {'age_check_done': '1'}
             try:
-                resp = await client.get(f"https://adult.contents.fc2.com/article/{fc2_id}/", cookies=cookies, follow_redirects=True)
+                resp = await client.get(f"https://adult.contents.fc2.com/article/{fc2_id}/", cookies={'age_check_done': '1'}, follow_redirects=True)
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 og_img = soup.find('meta', property='og:image')
                 cover_img = og_img['content'] if og_img else ""
                 samples = [img.get('src') for img in soup.select('.items_article_SampleImages img') if img.get('src')]
-                return {"cover": cover_img, "samples": samples}
-            except Exception as e:
-                return {"cover": "", "samples": [], "error": str(e)}
+            except Exception:
+                pass
                 
-        # B. 非FC2 资源处理
+        # B. 普通番号刮削 (DMM优先 -> JavBus有码/无码 -> Search搜索)
         else:
-            cover_img = ""
-            samples = []
+            # 需求4: 优先尝试 DMM 官网强行组合提取
+            dmm_id = get_dmm_id(code)
+            dmm_base_url = f"https://pics.dmm.co.jp/digital/video/{dmm_id}/{dmm_id}"
             
-            # 【需求4】第一梯队：如果是正规 DMM 番号格式，直接从 DMM 官方图库拉取，无视反爬
-            m = re.match(r'^([A-Za-z]+)[-_]?(\d{2,5})$', code)
-            if m:
-                prefix = m.group(1).lower()
-                number = m.group(2).zfill(5) # 比如 123 补全为 00123
-                dmm_code = f"{prefix}{number}"
-                # DMM 封面链接格式
-                dmm_cover_url = f"https://pics.dmm.co.jp/mono/movie/adult/{dmm_code}/{dmm_code}pl.jpg"
-                try:
-                    # 使用 HEAD 请求快速验证图片是否存在
-                    dmm_resp = await client.head(dmm_cover_url, timeout=5.0)
-                    if dmm_resp.status_code == 200:
-                        cover_img = dmm_cover_url
-                        # 获取缩略图，通常为 dmm_code-1.jpg 到 dmm_code-5.jpg
-                        for i in range(1, 6):
-                            sample_url = f"https://pics.dmm.co.jp/mono/movie/adult/{dmm_code}/{dmm_code}-{i}.jpg"
-                            s_resp = await client.head(sample_url, timeout=2.0)
-                            if s_resp.status_code == 200:
-                                samples.append(sample_url)
-                            else:
-                                break
-                except Exception as e:
-                    pass
-
-            # 第二梯队：如果 DMM 没找到 (或者是 HEYZO/加勒比)，走 JavBus 备用线路
+            try:
+                resp_dmm = await client.head(f"{dmm_base_url}pl.jpg", cookies={'age_check_done': '1'}, follow_redirects=True)
+                if resp_dmm.status_code == 200:
+                    cover_img = f"{dmm_base_url}pl.jpg"
+                    is_dmm = True
+            except Exception:
+                pass
+                
+            # 若 DMM 失败，回落使用 JavBus
             if not cover_img:
-                bus_url = f"https://www.javbus.com/{code}"
+                # 需求2: 数字开头的直接优先从 /uncensored/ 刮削
+                first_url = f"https://www.javbus.com/uncensored/{code}" if code[0].isdigit() else f"https://www.javbus.com/{code}"
+                second_url = f"https://www.javbus.com/{code}" if code[0].isdigit() else f"https://www.javbus.com/uncensored/{code}"
+                
                 try:
-                    resp = await client.get(bus_url, follow_redirects=True)
-                    
-                    # 如果有码区找不到，尝试无码区路径
+                    resp = await client.get(first_url, follow_redirects=True)
                     if resp.status_code == 404:
-                        bus_url = f"https://www.javbus.com/uncensored/{code}"
-                        resp = await client.get(bus_url, follow_redirects=True)
+                        resp = await client.get(second_url, follow_redirects=True)
                         
                     soup = BeautifulSoup(resp.text, 'html.parser')
                     cover_tag = soup.select_one('.bigImage img')
                     
-                    # 如果详情页依然拿不到，直接请求 Search 页面刮削第一张瀑布流图片
                     if cover_tag:
-                        cover_img = cover_tag['src']
+                        cover_img = cover_tag.get('src', '')
                     else:
-                        search_url = f"https://www.javbus.com/search/{code}"
-                        resp_search = await client.get(search_url, follow_redirects=True)
+                        resp_search = await client.get(f"https://www.javbus.com/search/{code}", follow_redirects=True)
                         soup_search = BeautifulSoup(resp_search.text, 'html.parser')
                         search_img = soup_search.select_one('#waterfall .movie-box img')
                         if search_img:
-                            cover_img = search_img.get('src', '')
+                            cover_img = search_img.get('src', '').replace('thumb/', 'cover/').replace('_b.jpg', '_b.jpg')
 
-                    # 补全绝对路径
                     if cover_img and not cover_img.startswith('http'):
                         cover_img = "https://www.javbus.com" + cover_img
                         
-                    # 提取详情页预览图
-                    bus_samples = [img['src'] for img in soup.select('.sample-box img') if img.get('src')]
-                    if bus_samples:
-                        samples = bus_samples
-                except Exception as e:
+                    samples = [img.get('src') for img in soup.select('.sample-box img') if img.get('src')]
+                except Exception:
                     pass
-                    
-            return {"cover": cover_img, "samples": samples}
+
+        # 下载图片到本地逻辑
+        local_cover = ""
+        local_samples = []
+        
+        if cover_img:
+            ext = cover_img.split('.')[-1][:4]
+            ext = re.sub(r'[^a-zA-Z0-9]', '', ext) or 'jpg'
+            c_path = f"{IMG_DIR}/{code}_cover.{ext}"
+            if await download_image(client, cover_img, c_path):
+                local_cover = f"/img/{code}_cover.{ext}"
+                
+        # 详细图分流下载
+        if is_dmm:
+            # DMM: 顺序探测下载，一旦遇到 404 马上停止，绝不浪费网络请求
+            for i in range(1, 21):
+                s_url = f"{dmm_base_url}jp-{i}.jpg"
+                s_path = f"{IMG_DIR}/{code}_sample_{i}.jpg"
+                if await download_image(client, s_url, s_path):
+                    local_samples.append(f"/img/{code}_sample_{i}.jpg")
+                else:
+                    break
+        else:
+            # JavBus / FC2: 直接下载拿到的数组
+            for idx, s_url in enumerate(samples):
+                ext = s_url.split('.')[-1][:4]
+                ext = re.sub(r'[^a-zA-Z0-9]', '', ext) or 'jpg'
+                s_path = f"{IMG_DIR}/{code}_sample_{idx+1}.{ext}"
+                if await download_image(client, s_url, s_path):
+                    local_samples.append(f"/img/{code}_sample_{idx+1}.{ext}")
+
+        # 写入缓存
+        if local_cover or local_samples:
+            cache_entry = db.query(MetadataCache).filter(MetadataCache.code == code).first()
+            if cache_entry:
+                cache_entry.cover_path = local_cover or cache_entry.cover_path
+                cache_entry.samples_json = json.dumps(local_samples)
+            else:
+                cache_entry = MetadataCache(code=code, cover_path=local_cover, samples_json=json.dumps(local_samples))
+                db.add(cache_entry)
+            db.commit()
+            
+        return {"cover": local_cover, "samples": local_samples}
 
 # --- 4. qB 推送 ---
 class DownloadRequest(BaseModel):

@@ -47,7 +47,7 @@
                  class="w-full h-full object-contain group-hover:opacity-90 transition-opacity" />
             
             <div v-else class="absolute inset-0 flex items-center justify-center text-bus-text-muted text-sm">
-              {{ item.meta === null ? '正在连接深海...' : '暂无封面' }}
+              {{ item.meta === null ? '正在连接深海...' : '暂无封面或被屏蔽' }}
             </div>
             
             <div class="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
@@ -61,7 +61,7 @@
             </div>
             
             <h3 class="text-sm text-bus-text-light line-clamp-3 mb-3 flex-grow" :title="item.title">
-              {{ item.title }}
+              {{ formatTitle(item.title, item.code) }}
             </h3>
 
             <div class="relative group/thumbs mt-auto" v-if="item.meta?.samples?.length > 0">
@@ -70,7 +70,7 @@
                  <span class="text-white drop-shadow-md text-xl">&lt;</span>
               </div>
               
-              <div class="thumb-container flex gap-2 overflow-x-hidden hide-scrollbar pb-1">
+              <div class="thumb-container flex gap-2 overflow-x-auto hide-scrollbar pb-1">
                 <img v-for="(img, idx) in item.meta.samples" :key="idx" :src="img" 
                      @click.stop="openViewer([item.meta.cover, ...item.meta.samples], idx + 1)"
                      class="h-20 w-auto rounded object-cover cursor-pointer hover:opacity-80 transition-opacity shrink-0 border border-transparent hover:border-bus-primary" />
@@ -85,11 +85,8 @@
             <div class="flex justify-end items-center mt-4 pt-3 border-t border-bus-border">
               <div class="flex gap-3 text-bus-text-muted text-xs flex-wrap">
                 <a :href="item.code.includes('FC2') ? `https://adult.contents.fc2.com/article/${item.code.split('-')[2]}/` : `https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">官网</a>
-                
                 <a :href="`https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">JavBus</a>
-                
                 <a :href="`https://www.avbase.net/works?q=${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">Avbase</a>
-                
                 <a :href="`https://sukebei.nyaa.si/?f=0&c=0_0&q=${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">Nyaa</a>
               </div>
             </div>
@@ -129,6 +126,13 @@
             <label class="block text-sm text-bus-text-muted mb-2">Nyaa RSS 订阅源</label>
             <input v-model="settings.rss_url" type="text" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:outline-none focus:border-bus-primary transition-colors">
           </div>
+          
+          <div>
+            <label class="block text-sm text-bus-text-muted mb-2">不刮削的番号前缀 (逗号分隔)</label>
+            <input v-model="settings.block_prefixes" type="text" placeholder="如: XB-,MD-,JV-" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:outline-none focus:border-bus-primary transition-colors">
+            <p class="text-[11px] text-gray-500 mt-1">命中这些前缀的番号将直接跳过网络刮削，提高加载速度。</p>
+          </div>
+
           <hr class="border-bus-border">
           <div class="space-y-3">
             <label class="block text-sm text-bus-text-muted mb-1">qBittorrent 连接信息</label>
@@ -143,12 +147,12 @@
           </div>
         </div>
         <div class="p-4 border-t border-bus-border bg-bus-bg flex justify-between items-center">
-          <button @click="testConnection" :disabled="testing" class="text-sm text-bus-primary hover:underline disabled:opacity-50">
+          <button @click="testConnection" :disabled="testing" class="text-sm text-bus-primary hover:underline">
             {{ testing ? '测试中...' : '⚡ 测试 qB 连接' }}
           </button>
           <div class="flex gap-3">
             <button @click="showSettings = false" class="px-4 py-2 text-sm text-bus-text-muted hover:text-bus-text-light">取消</button>
-            <button @click="saveSettings" class="px-5 py-2 text-sm bg-bus-primary text-white rounded font-medium shadow hover:bg-blue-500 transition-colors">保存配置</button>
+            <button @click="saveSettings" class="px-5 py-2 text-sm bg-bus-primary text-white rounded hover:bg-blue-500 transition-colors">保存配置</button>
           </div>
         </div>
       </div>
@@ -185,7 +189,20 @@ const testSuccess = ref(false)
 const currentPage = ref(1)
 const totalPages = ref(1)
 
-const settings = ref({ qb_host: '', qb_user: '', qb_pass: '', rss_url: '' })
+const settings = ref({ qb_host: '', qb_user: '', qb_pass: '', rss_url: '', block_prefixes: '' })
+
+// 需求3: 清理标题工具函数
+const formatTitle = (title, code) => {
+  if (!title) return ''
+  // 去除开头的 ++ [FHD] 等修饰符
+  let res = title.replace(/^[+\s]+/, '').replace(/^\[.*?\]\s*/, '')
+  // 去除标题中包含的番号本身
+  if (code) {
+     const reg = new RegExp(`^${code}\\s*`, 'i')
+     res = res.replace(reg, '')
+  }
+  return res.trim() || title
+}
 
 // 生成当前可视的页码列表 (例如展示当前页及前后2页)
 const visiblePages = computed(() => {
@@ -227,7 +244,15 @@ const fetchRss = async (page) => {
 const fetchMetadata = async (item) => {
   try {
     const res = await fetch(`${API_BASE}/api/metadata/${item.code}`)
-    item.meta = await res.json()
+    const data = await res.json()
+    // 自动补全本地缓存图片的绝对路径
+    if (data.cover && data.cover.startsWith('/')) {
+        data.cover = API_BASE + data.cover
+    }
+    if (data.samples) {
+        data.samples = data.samples.map(s => s.startsWith('/') ? API_BASE + s : s)
+    }
+    item.meta = data
   } catch (e) {
     item.meta = { cover: '', samples: [] }
   }
@@ -237,7 +262,6 @@ const fetchMetadata = async (item) => {
 const viewer = ref({ show: false, images: [], index: 0 })
 
 const openViewer = (imagesList, startIndex) => {
-  // 过滤掉可能为空的封面或烂图
   const validImages = imagesList.filter(url => url && url.trim() !== '')
   if (validImages.length === 0) return
   viewer.value = { show: true, images: validImages, index: startIndex }
@@ -249,12 +273,11 @@ const nextImg = () => { if (viewer.value.index < viewer.value.images.length - 1)
 // 缩略图平滑滚动逻辑
 let scrollTimer = null
 const startScroll = (e, direction) => {
-  // 找到当前卡片下的 thumb-container
   const container = e.target.parentElement.querySelector('.thumb-container')
   if (!container) return
   stopScroll()
   scrollTimer = setInterval(() => {
-    container.scrollLeft += direction * 8 // 滚动速度
+    container.scrollLeft += direction * 8
   }, 16)
 }
 const stopScroll = () => {
