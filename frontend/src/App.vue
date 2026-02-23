@@ -41,10 +41,10 @@
             已推送记录
           </div>
 
-          <div class="relative w-full aspect-[2/3] bg-[#1a1c1d] overflow-hidden cursor-pointer group flex-shrink-0" 
+          <div class="relative w-full aspect-video bg-[#1a1c1d] overflow-hidden cursor-pointer group flex-shrink-0" 
                @click="openViewer([item.meta?.cover, ...(item.meta?.samples || [])], 0)">
             <img v-if="item.meta?.cover" :src="item.meta.cover" loading="lazy" 
-                 class="w-full h-full object-cover group-hover:opacity-90 transition-opacity" />
+                 class="w-full h-full object-contain group-hover:opacity-90 transition-opacity" />
             
             <div v-else class="absolute inset-0 flex items-center justify-center text-bus-text-muted text-sm">
               {{ item.meta === null ? '正在连接深海...' : '暂无封面' }}
@@ -82,15 +82,15 @@
               </div>
             </div>
 
-            <div class="flex justify-between items-center mt-4 pt-3 border-t border-bus-border">
-              <div class="flex gap-2 text-bus-text-muted text-xs flex-wrap">
-                <a :href="item.code.includes('FC2') ? `https://adult.contents.fc2.com/article/${item.code.split('-')[2]}/` : `https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">官网</a>
+            <div class="flex justify-end items-center mt-4 pt-3 border-t border-bus-border">
+              <div class="flex gap-3 text-bus-text-muted text-xs flex-wrap">
+                <a :href="item.code.includes('FC2') ? `https://adult.contents.fc2.com/article/${item.code.split('-')[2]}/` : `https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">官网</a>
                 
-                <a :href="`https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">JavBus</a>
+                <a :href="`https://www.javbus.com/search/${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">JavBus</a>
                 
-                <a :href="`https://www.avbase.net/works?q=${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">Avbase</a>
+                <a :href="`https://www.avbase.net/works?q=${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">Avbase</a>
                 
-                <a :href="`https://sukebei.nyaa.si/?f=0&c=0_0&q=${item.code}`" target="_blank" class="hover:text-bus-primary border border-bus-border px-1.5 py-0.5 rounded">Nyaa</a>
+                <a :href="`https://sukebei.nyaa.si/?f=0&c=0_0&q=${item.code}`" target="_blank" class="hover:text-bus-primary transition-colors">Nyaa</a>
               </div>
             </div>
           </div>
@@ -127,15 +127,15 @@
         <div class="p-6 space-y-5">
           <div>
             <label class="block text-sm text-bus-text-muted mb-2">Nyaa RSS 订阅源</label>
-            <input v-model="settings.rss_url" type="text" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:border-bus-primary">
+            <input v-model="settings.rss_url" type="text" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:outline-none focus:border-bus-primary transition-colors">
           </div>
           <hr class="border-bus-border">
           <div class="space-y-3">
             <label class="block text-sm text-bus-text-muted mb-1">qBittorrent 连接信息</label>
-            <input v-model="settings.qb_host" type="text" placeholder="主机地址 (如: http://192.168.0.2:8080)" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:border-bus-primary">
+            <input v-model="settings.qb_host" type="text" placeholder="主机地址 (如: http://192.168.0.2:8080)" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:outline-none focus:border-bus-primary transition-colors">
             <div class="flex gap-3">
-              <input v-model="settings.qb_user" type="text" placeholder="用户名" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:border-bus-primary">
-              <input v-model="settings.qb_pass" type="password" placeholder="密码" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:border-bus-primary">
+              <input v-model="settings.qb_user" type="text" placeholder="用户名" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:outline-none focus:border-bus-primary transition-colors">
+              <input v-model="settings.qb_pass" type="password" placeholder="密码" class="w-full bg-bus-bg border border-bus-border p-2.5 rounded text-sm text-bus-text-light focus:outline-none focus:border-bus-primary transition-colors">
             </div>
           </div>
           <div v-if="testMsg" :class="testSuccess ? 'text-bus-green' : 'text-bus-danger'" class="text-xs bg-bus-bg p-2 rounded">
@@ -143,12 +143,12 @@
           </div>
         </div>
         <div class="p-4 border-t border-bus-border bg-bus-bg flex justify-between items-center">
-          <button @click="testConnection" :disabled="testing" class="text-sm text-bus-primary hover:underline">
+          <button @click="testConnection" :disabled="testing" class="text-sm text-bus-primary hover:underline disabled:opacity-50">
             {{ testing ? '测试中...' : '⚡ 测试 qB 连接' }}
           </button>
           <div class="flex gap-3">
             <button @click="showSettings = false" class="px-4 py-2 text-sm text-bus-text-muted hover:text-bus-text-light">取消</button>
-            <button @click="saveSettings" class="px-5 py-2 text-sm bg-bus-primary text-white rounded hover:bg-blue-500 transition-colors">保存配置</button>
+            <button @click="saveSettings" class="px-5 py-2 text-sm bg-bus-primary text-white rounded font-medium shadow hover:bg-blue-500 transition-colors">保存配置</button>
           </div>
         </div>
       </div>

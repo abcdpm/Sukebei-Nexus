@@ -97,6 +97,8 @@ def test_qb_connection(config: SettingsDTO):
 def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
     setting = db.query(AppSettings).first()
     base_url = setting.rss_url if setting and setting.rss_url else "https://sukebei.nyaa.si/?page=rss&u=offkab"
+    if page > 1:
+        base_url += f"&p={page}"
         
     feed = feedparser.parse(base_url)
     results = []
@@ -128,8 +130,15 @@ def get_rss(page: int = 1, limit: int = 24, db: Session = Depends(get_db)):
         elif match_normal:
             code = match_normal.group(1).upper()
             
+        # 【需求3】清理标题：剥离 ++ 、括号内容以及番号本身
+        clean_title = re.sub(r'^[+\s]+', '', title)  # 去掉开头的 ++
+        clean_title = re.sub(r'^\[.*?\]\s*', '', clean_title)  # 去掉开头的 [FHD] 等
+        if code != "UNKNOWN":
+            # 忽略大小写，将匹配到的番号从标题中剥离
+            clean_title = re.sub(rf'{code}\s*', '', clean_title, flags=re.IGNORECASE).strip()
+            
         results.append({
-            "title": title, "link": entry.link, "code": code,
+            "title": clean_title, "link": entry.link, "code": code,
             "is_downloaded": code in downloaded_codes
         })
     # 返回总页数给前端生成 1 2 3 4 按钮
@@ -156,41 +165,72 @@ async def get_metadata(code: str):
             except Exception as e:
                 return {"cover": "", "samples": [], "error": str(e)}
                 
-        # B. 普通番号 JavBus 刮削 (加入 404 降级至无码区重试机制，以及 Search 页面回落)
+        # B. 非FC2 资源处理
         else:
-            bus_url = f"https://www.javbus.com/{code}"
-            try:
-                resp = await client.get(bus_url, follow_redirects=True)
-                
-                # 如果有码区找不到，尝试无码区路径
-                if resp.status_code == 404:
-                    bus_url = f"https://www.javbus.com/uncensored/{code}"
+            cover_img = ""
+            samples = []
+            
+            # 【需求4】第一梯队：如果是正规 DMM 番号格式，直接从 DMM 官方图库拉取，无视反爬
+            m = re.match(r'^([A-Za-z]+)[-_]?(\d{2,5})$', code)
+            if m:
+                prefix = m.group(1).lower()
+                number = m.group(2).zfill(5) # 比如 123 补全为 00123
+                dmm_code = f"{prefix}{number}"
+                # DMM 封面链接格式
+                dmm_cover_url = f"https://pics.dmm.co.jp/mono/movie/adult/{dmm_code}/{dmm_code}pl.jpg"
+                try:
+                    # 使用 HEAD 请求快速验证图片是否存在
+                    dmm_resp = await client.head(dmm_cover_url, timeout=5.0)
+                    if dmm_resp.status_code == 200:
+                        cover_img = dmm_cover_url
+                        # 获取缩略图，通常为 dmm_code-1.jpg 到 dmm_code-5.jpg
+                        for i in range(1, 6):
+                            sample_url = f"https://pics.dmm.co.jp/mono/movie/adult/{dmm_code}/{dmm_code}-{i}.jpg"
+                            s_resp = await client.head(sample_url, timeout=2.0)
+                            if s_resp.status_code == 200:
+                                samples.append(sample_url)
+                            else:
+                                break
+                except Exception as e:
+                    pass
+
+            # 第二梯队：如果 DMM 没找到 (或者是 HEYZO/加勒比)，走 JavBus 备用线路
+            if not cover_img:
+                bus_url = f"https://www.javbus.com/{code}"
+                try:
                     resp = await client.get(bus_url, follow_redirects=True)
                     
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                cover_tag = soup.select_one('.bigImage img')
-                cover_img = ""
-                
-                # 如果详情页依然拿不到，直接请求 Search 页面刮削第一张瀑布流图片
-                if cover_tag:
-                    cover_img = cover_tag['src']
-                else:
-                    search_url = f"https://www.javbus.com/search/{code}"
-                    resp_search = await client.get(search_url, follow_redirects=True)
-                    soup_search = BeautifulSoup(resp_search.text, 'html.parser')
-                    search_img = soup_search.select_one('#waterfall .movie-box img')
-                    if search_img:
-                        cover_img = search_img.get('src', '')
-
-                # 补全绝对路径
-                if cover_img and not cover_img.startswith('http'):
-                    cover_img = "https://www.javbus.com" + cover_img
+                    # 如果有码区找不到，尝试无码区路径
+                    if resp.status_code == 404:
+                        bus_url = f"https://www.javbus.com/uncensored/{code}"
+                        resp = await client.get(bus_url, follow_redirects=True)
+                        
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    cover_tag = soup.select_one('.bigImage img')
                     
-                # 提取详情页预览图
-                samples = [img['src'] for img in soup.select('.sample-box img') if img.get('src')]
-                return {"cover": cover_img, "samples": samples}
-            except Exception as e:
-                return {"cover": "", "samples": [], "error": str(e)}
+                    # 如果详情页依然拿不到，直接请求 Search 页面刮削第一张瀑布流图片
+                    if cover_tag:
+                        cover_img = cover_tag['src']
+                    else:
+                        search_url = f"https://www.javbus.com/search/{code}"
+                        resp_search = await client.get(search_url, follow_redirects=True)
+                        soup_search = BeautifulSoup(resp_search.text, 'html.parser')
+                        search_img = soup_search.select_one('#waterfall .movie-box img')
+                        if search_img:
+                            cover_img = search_img.get('src', '')
+
+                    # 补全绝对路径
+                    if cover_img and not cover_img.startswith('http'):
+                        cover_img = "https://www.javbus.com" + cover_img
+                        
+                    # 提取详情页预览图
+                    bus_samples = [img['src'] for img in soup.select('.sample-box img') if img.get('src')]
+                    if bus_samples:
+                        samples = bus_samples
+                except Exception as e:
+                    pass
+                    
+            return {"cover": cover_img, "samples": samples}
 
 # --- 4. qB 推送 ---
 class DownloadRequest(BaseModel):
